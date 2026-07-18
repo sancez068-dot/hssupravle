@@ -264,7 +264,6 @@ async def ws_view(websocket: WebSocket, device_id: str, session_token: Optional[
 # ---------- API (поддержка JSON и Form) ----------
 @app.post("/api/command/poll")
 async def poll_commands(request: Request):
-    # Принимаем и JSON, и Form
     if request.headers.get("content-type") == "application/json":
         data = await request.json()
         device_id = data.get("device_id")
@@ -352,15 +351,384 @@ async def heartbeat(request: Request):
     logger.debug(f"Heartbeat from {device_id}")
     return {"status": "ok"}
 
-# ---------- Остальные эндпоинты (без изменений) ----------
-# ... (здесь все /api/devices, /api/v1/devices, /api/device/... и т.д. – они уже были в коде, я не буду дублировать, но они должны остаться)
+# ---------- Остальные эндпоинты ----------
+@app.get("/api/devices")
+async def get_devices(session: str = Depends(get_current_user)):
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM devices ORDER BY registered_at DESC")
+        rows = await cur.fetchall()
+        devices = [dict(r) for r in rows]
+        for d in devices:
+            d["online"] = d["device_id"] in stream_connections
+            cur2 = await db.execute("SELECT COUNT(*) FROM commands_queue WHERE device_id=? AND status='pending'", (d["device_id"],))
+            cnt = await cur2.fetchone()
+            d["queue_count"] = cnt[0] if cnt else 0
+        return devices
 
-# Для полноты, если вы копируете этот код, вставьте сюда все остальные эндпоинты (get_devices, list_files, download_file_rest, upload_file_small, upload_big, delete_file, rename_file, install_apk, touch, swipe, shell, broadcast, delete_device_api, delete_device_web, /api/docs, /openapi.json, /health) – они идентичны предыдущей версии. Я приведу их в финальном сниппете.
+@app.get("/api/v1/devices")
+async def get_devices_api(api_key: str = Depends(verify_api_key)):
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM devices ORDER BY registered_at DESC")
+        rows = await cur.fetchall()
+        devices = [dict(r) for r in rows]
+        for d in devices:
+            d["online"] = d["device_id"] in stream_connections
+            cur2 = await db.execute("SELECT COUNT(*) FROM commands_queue WHERE device_id=? AND status='pending'", (d["device_id"],))
+            cnt = await cur2.fetchone()
+            d["queue_count"] = cnt[0] if cnt else 0
+        return devices
+
+@app.get("/api/device/{device_id}/files")
+async def list_files(device_id: str, path: str = Query("/"), session: str = Depends(get_current_user)):
+    path = safe_path(path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "list_files", "path": path})
+        if res.get("status") == "success": return res.get("result", [])
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.get("/api/device/{device_id}/file")
+async def download_file_rest(device_id: str, path: str = Query(...), session: str = Depends(get_current_user)):
+    path = safe_path(path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "download_file", "path": path}, 60.0)
+        if res.get("status") != "success": raise HTTPException(500, res.get("error", "Unknown"))
+        data_b64 = res.get("result", {}).get("data")
+        if not data_b64: raise HTTPException(500, "No data")
+        content = base64.b64decode(data_b64)
+        return StreamingResponse(iter([content]), media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename={os.path.basename(path)}"})
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/file")
+async def upload_file_small(device_id: str, file: UploadFile = File(...), path: str = Form(...), overwrite: bool = Form(True), session: str = Depends(get_current_user)):
+    path = safe_path(path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    content = await file.read()
+    if len(content) > MAX_INLINE_FILE_SIZE:
+        raise HTTPException(413, f"File too large (max {MAX_INLINE_FILE_SIZE//1024//1024} MB) - use /upload_big")
+    try:
+        res = await send_command_to_device(device_id, {"command": "upload_file", "path": path, "overwrite": overwrite}, 60.0, file_data=content)
+        if res.get("status") == "success":
+            await log_action(session, "upload_file", device_id, f"Uploaded {file.filename} to {path}")
+            return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            await log_action(session, "upload_file_queued", device_id, f"Queued {path}")
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/upload_big")
+async def upload_file_big(device_id: str, file: UploadFile = File(...), path: str = Form(...), overwrite: bool = Form(True), session: str = Depends(get_current_user)):
+    path = safe_path(path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    content = await file.read()
+    if len(content) > MAX_BIG_FILE_SIZE: raise HTTPException(413, f"File too large (max {MAX_BIG_FILE_SIZE//1024//1024} MB)")
+    try:
+        res = await send_command_to_device(device_id, {"command": "upload_file", "path": path, "overwrite": overwrite}, 60.0, file_data=content)
+        if res.get("status") == "success":
+            await log_action(session, "upload_big", device_id, f"Uploaded {file.filename} to {path}")
+            return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            await log_action(session, "upload_big_queued", device_id, f"Queued {path}")
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.delete("/api/device/{device_id}/file")
+async def delete_file(device_id: str, path: str = Query(...), recursive: bool = False, session: str = Depends(get_current_user)):
+    path = safe_path(path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "delete_file", "path": path, "recursive": recursive})
+        if res.get("status") == "success":
+            await log_action(session, "delete_file", device_id, f"Deleted {path}")
+            return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.put("/api/device/{device_id}/file")
+async def rename_file(device_id: str, old_path: str = Query(...), new_path: str = Query(...), session: str = Depends(get_current_user)):
+    old_path = safe_path(old_path); new_path = safe_path(new_path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "rename_file", "old_path": old_path, "new_path": new_path})
+        if res.get("status") == "success":
+            await log_action(session, "rename_file", device_id, f"Renamed {old_path} to {new_path}")
+            return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/install_apk")
+async def install_apk(device_id: str, apk_path: str = Form(...), session: str = Depends(get_current_user)):
+    apk_path = safe_path(apk_path)
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "install_apk", "apk_path": apk_path}, 120.0)
+        if res.get("status") == "success":
+            await log_action(session, "install_apk", device_id, f"Installed {apk_path}")
+            return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/touch")
+async def touch(device_id: str, x: float = Form(...), y: float = Form(...), action: str = Form("click"), session: str = Depends(get_current_user)):
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "touch", "x": x, "y": y, "action": action})
+        if res.get("status") == "success": return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/swipe")
+async def swipe(device_id: str, x1: float = Form(...), y1: float = Form(...), x2: float = Form(...), y2: float = Form(...), duration: int = Form(300), session: str = Depends(get_current_user)):
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration})
+        if res.get("status") == "success": return {"status": "ok"}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/device/{device_id}/shell")
+async def shell(device_id: str, command: str = Form(...), session: str = Depends(get_current_user)):
+    async with aiosqlite.connect(DATABASE_URL) as db: await get_device_or_404(device_id, db)
+    try:
+        res = await send_command_to_device(device_id, {"command": "shell", "cmd": command}, 60.0)
+        if res.get("status") == "success":
+            await log_action(session, "shell", device_id, f"Executed: {command}")
+            return {"status": "ok", "output": res.get("result", "")}
+        raise HTTPException(500, res.get("error", "Unknown"))
+    except HTTPException as e:
+        if e.status_code == 202:
+            return JSONResponse(202, {"status": "queued", "command_id": e.headers.get("X-Command-ID"), "detail": e.detail})
+        raise
+
+@app.post("/api/devices/command")
+async def broadcast(command: dict, session: str = Depends(get_current_user)):
+    if "command" not in command: raise HTTPException(400, "Missing 'command' field")
+    results = {}
+    for device_id, ws in stream_connections.items():
+        try:
+            cmd = command.copy()
+            cmd["command_id"] = generate_command_id()
+            future = asyncio.get_event_loop().create_future()
+            pending_commands[cmd["command_id"]] = future
+            await ws.send_text(json.dumps(cmd))
+            results[device_id] = {"status": "sent"}
+        except Exception as e: results[device_id] = {"error": str(e)}
+    await log_action(session, "broadcast", details=f"Broadcasted: {command}")
+    return {"status": "ok", "results": results}
+
+@app.delete("/api/device/{device_id}")
+async def delete_device_api(device_id: str, api_key: str = Depends(verify_api_key)):
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        await get_device_or_404(device_id, db)
+        await db.execute("DELETE FROM devices WHERE device_id=?", (device_id,))
+        await db.execute("DELETE FROM commands_queue WHERE device_id=?", (device_id,))
+        await db.commit()
+    stream_connections.pop(device_id, None)
+    if device_id in view_connections:
+        for ws in view_connections[device_id]:
+            try: await ws.close(1000)
+            except: pass
+        del view_connections[device_id]
+    for fname in os.listdir(TEMP_DIR):
+        if fname.startswith(device_id):
+            try: os.remove(os.path.join(TEMP_DIR, fname))
+            except: pass
+    await log_action("API", "delete_device", device_id)
+    return {"status": "ok"}
+
+@app.delete("/api/web/device/{device_id}")
+async def delete_device_web(device_id: str, session: str = Depends(get_current_user)):
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        await get_device_or_404(device_id, db)
+        await db.execute("DELETE FROM devices WHERE device_id=?", (device_id,))
+        await db.execute("DELETE FROM commands_queue WHERE device_id=?", (device_id,))
+        await db.commit()
+    stream_connections.pop(device_id, None)
+    if device_id in view_connections:
+        for ws in view_connections[device_id]:
+            try: await ws.close(1000)
+            except: pass
+        del view_connections[device_id]
+    for fname in os.listdir(TEMP_DIR):
+        if fname.startswith(device_id):
+            try: os.remove(os.path.join(TEMP_DIR, fname))
+            except: pass
+    await log_action(session, "delete_device", device_id)
+    return {"status": "ok"}
+
+@app.get("/api/docs", include_in_schema=False)
+async def swagger_docs(session: str = Depends(get_current_user)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="HSSUPRavle API")
+
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi(session: str = Depends(get_current_user)):
+    return app.openapi()
+
+# ---------- Health check (для Render) ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 # ---------- Веб-интерфейс ----------
-# (HTML-страницы без изменений, можете оставить как было)
+LOGIN_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Login</title></head>
+<body style="background:#222;color:#eee;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;">
+<div style="background:#333;padding:30px;border-radius:8px;width:300px;text-align:center;">
+<h1 style="color:#e94560;">HSSUPRavle</h1>
+<form action="/login" method="post">
+<input type="password" name="password" placeholder="Admin Password" style="width:100%;padding:10px;margin:10px 0;background:#444;border:none;color:#eee;border-radius:4px;">
+<button type="submit" style="width:100%;padding:10px;background:#e94560;border:none;color:#fff;font-weight:bold;cursor:pointer;border-radius:4px;">Enter</button>
+</form>
+</div></body></html>'''
 
-# ---------- Запуск ----------
+DASHBOARD_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Dashboard</title></head>
+<body style="background:#1a1a2e;color:#eee;font-family:monospace;padding:20px;">
+<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;">
+<h1 style="color:#e94560;margin:0;">HSSUPRavle</h1>
+<a href="/logout" style="color:#e94560;">Logout</a></div>
+<button onclick="refresh()" style="margin:20px 0;background:#333;color:#eee;border:none;padding:6px 12px;cursor:pointer;">Refresh</button>
+<table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#222;"><th>Name</th><th>ID</th><th>Status</th><th>Queue</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody id="devices"></tbody></table>
+<script>
+function refresh(){fetch('/api/devices',{credentials:'include'}).then(r=>r.json()).then(data=>{let h='';data.forEach(d=>{const online=d.online?'<span style="color:#0f0;">Online</span>':'<span style="color:#f00;">Offline</span>';const queue=d.queue_count?`<span style="color:#ff0;">${d.queue_count}</span>`:'0';h+=`<tr><td>${d.name}</td><td>${d.device_id.slice(0,8)}..</td><td>${online}</td><td>${queue}</td><td>${d.last_seen}</td><td><a href="/device/${d.device_id}" style="color:#0af;">Manage</a> <button onclick="del('${d.device_id}')" style="background:#e94560;border:none;color:#fff;cursor:pointer;">Delete</button></td></tr>`;});document.getElementById('devices').innerHTML=h;});}
+function del(id){if(confirm('Delete device?')){fetch('/api/web/device/'+id,{method:'DELETE',credentials:'include'}).then(()=>refresh());}}
+refresh();setInterval(refresh,10000);
+</script></body></html>'''
+
+DEVICE_PAGE_TEMPLATE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Device {device_id}</title></head>
+<body style="background:#1a1a2e;color:#eee;font-family:monospace;padding:20px;">
+<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;">
+<h1 style="color:#e94560;margin:0;">Device: {device_name} <span id="status" style="font-size:14px;color:#aaa;"></span></h1>
+<div><a href="/" style="color:#e94560;">Dashboard</a> | <a href="/logout" style="color:#e94560;">Logout</a></div></div>
+<div style="margin:10px 0;">
+<button onclick="showTab('files')" style="background:#333;border:none;color:#eee;padding:6px 16px;cursor:pointer;">Files</button>
+<button onclick="showTab('screen')" style="background:#333;border:none;color:#eee;padding:6px 16px;cursor:pointer;">Screen</button>
+<span id="queue-info" style="margin-left:20px;color:#aaa;"></span>
+</div>
+<div id="tab-files" style="display:block;">
+<div><input id="path" value="/storage/emulated/0" style="width:50%;background:#222;color:#eee;border:1px solid #444;padding:4px;">
+<button onclick="listFiles()" style="background:#333;border:none;color:#eee;padding:4px 12px;cursor:pointer;">Go</button>
+<button onclick="listFiles('/')" style="background:#333;border:none;color:#eee;padding:4px 12px;cursor:pointer;">Root</button>
+<button onclick="uploadFile()" style="background:#28a745;border:none;color:#fff;padding:4px 12px;cursor:pointer;">Upload</button>
+<button onclick="uploadBig()" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Upload Big</button>
+</div>
+<table style="width:100%;border-collapse:collapse;margin-top:10px;">
+<thead><tr style="background:#222;"><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
+<tbody id="filelist"></tbody></table>
+</div>
+<div id="tab-screen" style="display:none;">
+<img id="screen-img" style="width:100%;max-width:600px;border:1px solid #444;cursor:crosshair;" />
+<div style="margin-top:10px;">
+<button onclick="sendTouch(0.5,0.5,'click')" style="background:#28a745;border:none;color:#fff;padding:4px 12px;cursor:pointer;">Click</button>
+<button onclick="sendSwipe(0.2,0.5,0.8,0.5)" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Swipe H</button>
+<button onclick="sendSwipe(0.5,0.2,0.5,0.8)" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Swipe V</button>
+</div>
+</div>
+<div id="upload-modal" style="display:none;position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7);">
+<div style="background:#222;padding:20px;margin:10% auto;width:300px;border-radius:8px;">
+<h3>Upload File</h3>
+<input id="upload-path" placeholder="Target path" style="width:100%;background:#333;color:#eee;border:none;padding:6px;margin:6px 0;">
+<input id="upload-file" type="file" style="width:100%;margin:6px 0;">
+<button onclick="doUpload()" style="background:#28a745;border:none;color:#fff;padding:6px 12px;cursor:pointer;">Upload</button>
+<button onclick="document.getElementById('upload-modal').style.display='none'" style="background:#e94560;border:none;color:#fff;padding:6px 12px;cursor:pointer;">Cancel</button>
+</div>
+</div>
+<script>
+const deviceId='{device_id}';let currentPath='/storage/emulated/0';let bigMode=false;
+const ws=new WebSocket('wss://'+location.host+'/ws/view/'+deviceId);
+ws.onopen=()=>document.getElementById('status').textContent='🟢 Online';
+ws.onclose=()=>document.getElementById('status').textContent='🔴 Offline';
+ws.onmessage=e=>{if(e.data instanceof Blob){document.getElementById('screen-img').src=URL.createObjectURL(e.data);}else{try{const d=JSON.parse(e.data);console.log('Response:',d);}catch(e){}}};
+function showTab(t){document.querySelectorAll('[id^="tab-"]').forEach(el=>el.style.display='none');document.getElementById('tab-'+t).style.display='block';}
+function updateQueueInfo(){fetch('/api/devices',{credentials:'include'}).then(r=>r.json()).then(data=>{const d=data.find(x=>x.device_id===deviceId);if(d)document.getElementById('queue-info').textContent='Queue: '+(d.queue_count||0);});}
+function listFiles(path){if(path!==undefined)currentPath=path;else currentPath=document.getElementById('path').value;document.getElementById('path').value=currentPath;fetch('/api/device/'+deviceId+'/files?path='+encodeURIComponent(currentPath),{credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Command queued, check later');updateQueueInfo();return;}let html='';if(currentPath!=='/')html+='<tr><td><a href="#" onclick="listFiles(\''+currentPath+'/..\')">..</a></td><td></td><td></td><td></td></tr>';data.forEach(item=>{const isDir=item.is_dir;const size=isDir?'-':(item.size/1024).toFixed(1)+' KB';const actions=isDir?'<button onclick="listFiles(\''+currentPath+'/'+item.name+'\')">Open</button>':'<button onclick="downloadFile(\''+currentPath+'/'+item.name+'\')">Download</button> <button onclick="renameFile(\''+currentPath+'/'+item.name+'\')">Rename</button> <button onclick="deleteFile(\''+currentPath+'/'+item.name+'\')">Delete</button>'+(item.name.endsWith('.apk')?' <button onclick="installApk(\''+currentPath+'/'+item.name+'\')">Install</button>':'');html+='<tr><td>'+(isDir?'📁':'📄')+' '+item.name+'</td><td>'+size+'</td><td>'+(item.modified||'')+'</td><td>'+actions+'</td></tr>';});document.getElementById('filelist').innerHTML=html;});}
+function downloadFile(path){fetch('/api/device/'+deviceId+'/file?path='+encodeURIComponent(path),{credentials:'include'}).then(res=>{if(res.status===202)return res.json().then(data=>{alert('Queued: '+data.detail);throw new Error('queued');});return res.blob();}).then(blob=>{const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=path.split('/').pop();a.click();}).catch(err=>{if(err.message!=='queued')console.error(err);});}
+function deleteFile(path){if(!confirm('Delete '+path+'?'))return;fetch('/api/device/'+deviceId+'/file?path='+encodeURIComponent(path),{method:'DELETE',credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else listFiles();}).catch(err=>alert(err));}
+function renameFile(path){const newPath=prompt('New name:',path);if(!newPath||newPath===path)return;fetch('/api/device/'+deviceId+'/file?old_path='+encodeURIComponent(path)+'&new_path='+encodeURIComponent(newPath),{method:'PUT',credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else listFiles();}).catch(err=>alert(err));}
+function installApk(path){if(!confirm('Install APK '+path+'?'))return;fetch('/api/device/'+deviceId+'/install_apk',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'apk_path='+encodeURIComponent(path),credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else alert(data.status==='ok'?'Installed':'Error');}).catch(err=>alert(err));}
+function uploadFile(){bigMode=false;document.getElementById('upload-modal').style.display='block';}
+function uploadBig(){bigMode=true;document.getElementById('upload-modal').style.display='block';}
+function doUpload(){const file=document.getElementById('upload-file').files[0];const path=document.getElementById('upload-path').value;if(!file||!path){alert('Select file and path');return;}const fd=new FormData();fd.append('file',file);fd.append('path',path);const endpoint=bigMode?'/upload_big':'';fetch('/api/device/'+deviceId+'/file'+endpoint,{method:'POST',body:fd,credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Upload queued');updateQueueInfo();}else if(data.status==='ok'){alert('Uploaded');document.getElementById('upload-modal').style.display='none';listFiles();}else alert('Error');}).catch(err=>alert(err));}
+function sendTouch(x,y,action){ws.send(JSON.stringify({command:'touch',x,y,action}));}
+function sendSwipe(x1,y1,x2,y2,duration=300){ws.send(JSON.stringify({command:'swipe',x1,y1,x2,y2,duration}));}
+document.getElementById('screen-img').addEventListener('click',function(e){const rect=this.getBoundingClientRect();const x=(e.clientX-rect.left)/rect.width;const y=(e.clientY-rect.top)/rect.height;sendTouch(x,y,'click');});
+listFiles();setInterval(updateQueueInfo,5000);
+</script></body></html>'''
+
+async def web_auth(request: Request):
+    token = request.cookies.get("session_token")
+    if not token: return None
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        cur = await db.execute("SELECT * FROM sessions WHERE token=?", (token,))
+        if await cur.fetchone(): return token
+    return None
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    session = await web_auth(request)
+    return DASHBOARD_PAGE if session else LOGIN_PAGE
+
+@app.get("/device/{device_id}", response_class=HTMLResponse)
+async def device_page(request: Request, device_id: str):
+    session = await web_auth(request)
+    if not session: return LOGIN_PAGE
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        try: device = await get_device_or_404(device_id, db)
+        except: return HTMLResponse("Device not found", status_code=404)
+    return HTMLResponse(DEVICE_PAGE_TEMPLATE.format(device_id=device_id, device_name=device['name']))
+
+@app.post("/login")
+async def login(request: Request, password: str = Form(...)):
+    if password != ADMIN_PASSWORD:
+        return HTMLResponse(LOGIN_PAGE.replace('</form>', '</form><div style="color:#e94560;margin-top:10px;">Invalid password</div>'), status_code=401)
+    token = generate_session_token()
+    async with aiosqlite.connect(DATABASE_URL) as db:
+        await db.execute("INSERT INTO sessions(token) VALUES(?)", (token,))
+        await db.commit()
+    await log_action(token, "login")
+    resp = HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
+    resp.set_cookie("session_token", token, max_age=int(SESSION_TIMEOUT.total_seconds()), httponly=True, secure=False, samesite='lax')
+    return resp
+
+@app.get("/logout")
+async def logout(request: Request):
+    token = request.cookies.get("session_token")
+    if token:
+        async with aiosqlite.connect(DATABASE_URL) as db:
+            await db.execute("DELETE FROM sessions WHERE token=?", (token,))
+            await db.commit()
+        await log_action(token, "logout")
+    resp = HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
+    resp.delete_cookie("session_token")
+    return resp
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
