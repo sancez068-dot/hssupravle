@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="HSSUPRavle Control", version="2.2", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# HTTPSRedirectMiddleware убран – на Render внешние запросы уже идут по HTTPS
 
 stream_connections: Dict[str, WebSocket] = {}
 view_connections: Dict[str, Set[WebSocket]] = {}
@@ -527,16 +528,10 @@ async def swagger_docs(session: str = Depends(get_current_user)):
 async def openapi(session: str = Depends(get_current_user)):
     return app.openapi()
 
-# -------------------- Проверочные эндпоинты --------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-@app.head("/")
-async def head_root():
-    return HTMLResponse(status_code=200)
-
-# Веб-интерфейс (без изменений)
 LOGIN_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Login</title></head>
 <body style="background:#222;color:#eee;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;">
 <div style="background:#333;padding:30px;border-radius:8px;width:300px;text-align:center;">
