@@ -631,18 +631,19 @@ async def device_page(request:Request,device_id:str):
     if not session:return LOGIN_PAGE
     async with aiosqlite.connect(DATABASE_URL) as db:
         try:device=await get_device_or_404(device_id,db)
-        except:return HTMLResponse("Device not found",404)
+        except:return HTMLResponse("Device not found", status_code=404)
     return HTMLResponse(DEVICE_PAGE_TEMPLATE.format(device_id=device_id,device_name=device['name']))
 
 @app.post("/login")
 async def login(request:Request,password:str=Form(...)):
-    if password!=ADMIN_PASSWORD:return HTMLResponse(LOGIN_PAGE.replace('</form>','</form><div style="color:#e94560;margin-top:10px;">Invalid password</div>'),401)
+    if password!=ADMIN_PASSWORD:
+        return HTMLResponse(LOGIN_PAGE.replace('</form>','</form><div style="color:#e94560;margin-top:10px;">Invalid password</div>'), status_code=401)
     token=generate_session_token()
     async with aiosqlite.connect(DATABASE_URL) as db:
         await db.execute("INSERT INTO sessions(token) VALUES(?)",(token,))
         await db.commit()
     await log_action(token,"login")
-    resp=HTMLResponse(content="<script>window.location.href='/';</script>",302)
+    resp=HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
     resp.set_cookie("session_token",token,max_age=int(SESSION_TIMEOUT.total_seconds()),httponly=True,secure=True,samesite='lax')
     return resp
 
@@ -654,7 +655,7 @@ async def logout(request:Request):
             await db.execute("DELETE FROM sessions WHERE token=?",(token,))
             await db.commit()
         await log_action(token,"logout")
-    resp=HTMLResponse(content="<script>window.location.href='/';</script>",302)
+    resp=HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
     resp.delete_cookie("session_token")
     return resp
 
