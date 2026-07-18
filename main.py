@@ -6,7 +6,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depe
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-# from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware  # отключаем, чтобы не было редиректа
 from fastapi.openapi.docs import get_swagger_ui_html
 import aiosqlite, uvicorn
 
@@ -50,7 +49,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="HSSUPRavle Control", version="2.2", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-# if not os.getenv("DEBUG"): app.add_middleware(HTTPSRedirectMiddleware)  # отключено
 
 stream_connections: Dict[str, WebSocket] = {}
 view_connections: Dict[str, Set[WebSocket]] = {}
@@ -529,10 +527,14 @@ async def swagger_docs(session: str = Depends(get_current_user)):
 async def openapi(session: str = Depends(get_current_user)):
     return app.openapi()
 
-# -------------------- Добавляем /health для проверки --------------------
+# -------------------- Проверочные эндпоинты --------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.head("/")
+async def head_root():
+    return HTMLResponse(status_code=200)
 
 # Веб-интерфейс (без изменений)
 LOGIN_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Login</title></head>
