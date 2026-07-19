@@ -9,11 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 import aiosqlite, uvicorn
 
-# ---------- Настройка логирования ----------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
+LOG_FILE = "app.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# ---------- Переменные окружения ----------
+# ========== ПЕРЕМЕННЫЕ ==========
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 API_KEY = os.getenv("API_KEY", "default-api-key-change-me")
 SECRET_KEY = os.getenv("SECRET_KEY", "secret-key-for-sessions")
@@ -26,14 +34,16 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 DATABASE_URL = "hssucontrol.db"
 UPLOAD_EXPIRE_SECONDS = 3600
 
-# ---------- Lifespan ----------
+# ========== LIFESPAN ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("=== SERVER STARTING ===")
     await init_db()
     async with aiosqlite.connect(DATABASE_URL) as db:
         await db.execute("UPDATE commands_queue SET status='pending' WHERE status='in_progress'")
         await db.commit()
     yield
+    logger.info("=== SERVER SHUTTING DOWN ===")
     for ws in list(stream_connections.values()):
         try: await ws.close(code=1000)
         except: pass
@@ -53,13 +63,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, title="HSSUPRavle Control", version="2.3", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---------- Глобальные состояния ----------
+# ========== ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ==========
 stream_connections: Dict[str, WebSocket] = {}
 view_connections: Dict[str, Set[WebSocket]] = {}
 pending_commands: Dict[str, asyncio.Future] = {}
 uploads: Dict[str, dict] = {}
 
-# ---------- БД ----------
+# ========== БД ==========
 async def init_db():
     async with aiosqlite.connect(DATABASE_URL) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT UNIQUE NOT NULL,name TEXT NOT NULL,status TEXT DEFAULT 'inactive',last_seen TIMESTAMP,registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -68,10 +78,12 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS commands_queue(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,command TEXT NOT NULL,status TEXT DEFAULT 'pending',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,result TEXT,file_path TEXT)""")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_queue_device_status ON commands_queue(device_id,status)")
         await db.commit()
+    logger.info("Database initialized")
 
 def generate_session_token(): return secrets.token_urlsafe(32)
 def generate_command_id(): return str(uuid.uuid4())
 def generate_upload_id(): return secrets.token_urlsafe(16)
+
 def safe_path(path: str) -> str:
     if not path: return "/"
     n = os.path.normpath(path).replace('\\', '/')
@@ -102,7 +114,7 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
     if api_key != API_KEY: raise HTTPException(403, "Invalid API Key")
     return api_key
 
-# ---------- Очередь команд ----------
+# ========== ОЧЕРЕДЬ КОМАНД ==========
 async def enqueue_command(device_id: str, command: dict, file_data: Optional[bytes] = None) -> int:
     command_json = json.dumps(command)
     file_path = None
@@ -165,7 +177,7 @@ async def send_command_to_device(device_id: str, command: dict, timeout: float =
         db_id = await enqueue_command(device_id, command, file_data)
         raise HTTPException(202, "Device offline, command queued", headers={"X-Command-ID": cmd_id, "X-Queue-ID": str(db_id)})
 
-# ---------- Скачивание временных файлов ----------
+# ========== СКАЧИВАНИЕ ВРЕМЕННЫХ ФАЙЛОВ ==========
 @app.get("/api/download/{upload_id}")
 async def download_file(upload_id: str):
     upload = uploads.get(upload_id)
@@ -185,7 +197,7 @@ async def download_file(upload_id: str):
             uploads.pop(upload_id, None)
     return StreamingResponse(file_generator(), media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename={os.path.basename(file_path)}"})
 
-# ---------- WebSocket ----------
+# ========== WEBSOCKET ==========
 @app.websocket("/ws/stream/{device_id}")
 async def ws_stream(websocket: WebSocket, device_id: str):
     await websocket.accept()
@@ -261,18 +273,20 @@ async def ws_view(websocket: WebSocket, device_id: str, session_token: Optional[
             view_connections[device_id].discard(websocket)
             if not view_connections[device_id]: del view_connections[device_id]
 
-# ---------- API (поддержка JSON и Form) ----------
+# ========== API ==========
 @app.post("/api/command/poll")
 async def poll_commands(request: Request):
+    logger.info("=== POLL REQUEST ===")
     if request.headers.get("content-type") == "application/json":
         data = await request.json()
         device_id = data.get("device_id")
+        logger.info(f"JSON poll: {data}")
     else:
         form = await request.form()
         device_id = form.get("device_id")
+        logger.info(f"Form poll: {dict(form)}")
     if not device_id:
         raise HTTPException(400, "Missing device_id")
-    logger.info(f"Poll from device {device_id}")
     cmd = await get_pending_command(device_id)
     if not cmd: return {"status": "no_commands"}
     db_id = cmd.pop("_db_id")
@@ -280,6 +294,7 @@ async def poll_commands(request: Request):
 
 @app.post("/api/command/result")
 async def command_result(request: Request):
+    logger.info("=== COMMAND RESULT ===")
     if request.headers.get("content-type") == "application/json":
         data = await request.json()
         device_id = data.get("device_id")
@@ -301,36 +316,48 @@ async def command_result(request: Request):
     try: res = json.loads(result)
     except: res = {"raw": result}
     await complete_command(db_id, res, status)
-    logger.info(f"Result from device {device_id} for command {db_id}")
+    logger.info(f"Result from {device_id} for command {db_id}")
     return {"status": "ok"}
 
 @app.post("/api/register")
 async def register(request: Request):
-    if request.headers.get("content-type") == "application/json":
-        data = await request.json()
-        device_id = data.get("device_id")
-        device_name = data.get("device_name")
-        password = data.get("password")
-    else:
-        form = await request.form()
-        device_id = form.get("device_id")
-        device_name = form.get("device_name")
-        password = form.get("password")
+    logger.info("=== REGISTER REQUEST RECEIVED ===")
+    try:
+        if request.headers.get("content-type") == "application/json":
+            data = await request.json()
+            device_id = data.get("device_id")
+            device_name = data.get("device_name")
+            password = data.get("password")
+            logger.info(f"JSON registration: device_id={device_id}, device_name={device_name}, password={password[:4]}***")
+        else:
+            form = await request.form()
+            device_id = form.get("device_id")
+            device_name = form.get("device_name")
+            password = form.get("password")
+            logger.info(f"Form registration: device_id={device_id}, device_name={device_name}, password={password[:4] if password else 'None'}***")
+    except Exception as e:
+        logger.error(f"Error reading registration request: {e}")
+        raise HTTPException(400, "Invalid request format")
+
     if not device_id or not device_name or not password:
+        logger.error("Missing fields in registration")
         raise HTTPException(400, "Missing fields")
+
     if password != DEVICE_PASSWORD:
+        logger.error(f"Invalid password for device {device_id}")
         raise HTTPException(403, "Invalid device password")
+
     async with aiosqlite.connect(DATABASE_URL) as db:
         cur = await db.execute("SELECT * FROM devices WHERE device_id=?", (device_id,))
         if await cur.fetchone():
             await db.execute("UPDATE devices SET name=?,status='active',last_seen=CURRENT_TIMESTAMP WHERE device_id=?", (device_name, device_id))
             await db.commit()
-            logger.info(f"Device {device_id} ({device_name}) updated")
+            logger.info(f"Device {device_id} ({device_name}) UPDATED")
             return {"status": "updated"}
         else:
             await db.execute("INSERT INTO devices(device_id,name,status,last_seen) VALUES(?,?,'active',CURRENT_TIMESTAMP)", (device_id, device_name))
             await db.commit()
-            logger.info(f"Device {device_id} ({device_name}) registered")
+            logger.info(f"Device {device_id} ({device_name}) REGISTERED")
             return {"status": "registered"}
 
 @app.post("/api/heartbeat")
@@ -348,10 +375,9 @@ async def heartbeat(request: Request):
     async with aiosqlite.connect(DATABASE_URL) as db:
         await db.execute("UPDATE devices SET status=?,last_seen=CURRENT_TIMESTAMP WHERE device_id=?", (status, device_id))
         await db.commit()
-    logger.debug(f"Heartbeat from {device_id}")
     return {"status": "ok"}
 
-# ---------- Остальные эндпоинты ----------
+# ========== ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ ==========
 @app.get("/api/devices")
 async def get_devices(session: str = Depends(get_current_user)):
     async with aiosqlite.connect(DATABASE_URL) as db:
@@ -586,149 +612,4 @@ async def delete_device_web(device_id: str, session: str = Depends(get_current_u
     return {"status": "ok"}
 
 @app.get("/api/docs", include_in_schema=False)
-async def swagger_docs(session: str = Depends(get_current_user)):
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="HSSUPRavle API")
-
-@app.get("/openapi.json", include_in_schema=False)
-async def openapi(session: str = Depends(get_current_user)):
-    return app.openapi()
-
-# ---------- Health check (для Render) ----------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# ---------- Веб-интерфейс ----------
-LOGIN_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Login</title></head>
-<body style="background:#222;color:#eee;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;">
-<div style="background:#333;padding:30px;border-radius:8px;width:300px;text-align:center;">
-<h1 style="color:#e94560;">HSSUPRavle</h1>
-<form action="/login" method="post">
-<input type="password" name="password" placeholder="Admin Password" style="width:100%;padding:10px;margin:10px 0;background:#444;border:none;color:#eee;border-radius:4px;">
-<button type="submit" style="width:100%;padding:10px;background:#e94560;border:none;color:#fff;font-weight:bold;cursor:pointer;border-radius:4px;">Enter</button>
-</form>
-</div></body></html>'''
-
-DASHBOARD_PAGE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Dashboard</title></head>
-<body style="background:#1a1a2e;color:#eee;font-family:monospace;padding:20px;">
-<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;">
-<h1 style="color:#e94560;margin:0;">HSSUPRavle</h1>
-<a href="/logout" style="color:#e94560;">Logout</a></div>
-<button onclick="refresh()" style="margin:20px 0;background:#333;color:#eee;border:none;padding:6px 12px;cursor:pointer;">Refresh</button>
-<table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#222;"><th>Name</th><th>ID</th><th>Status</th><th>Queue</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody id="devices"></tbody></table>
-<script>
-function refresh(){fetch('/api/devices',{credentials:'include'}).then(r=>r.json()).then(data=>{let h='';data.forEach(d=>{const online=d.online?'<span style="color:#0f0;">Online</span>':'<span style="color:#f00;">Offline</span>';const queue=d.queue_count?`<span style="color:#ff0;">${d.queue_count}</span>`:'0';h+=`<tr><td>${d.name}</td><td>${d.device_id.slice(0,8)}..</td><td>${online}</td><td>${queue}</td><td>${d.last_seen}</td><td><a href="/device/${d.device_id}" style="color:#0af;">Manage</a> <button onclick="del('${d.device_id}')" style="background:#e94560;border:none;color:#fff;cursor:pointer;">Delete</button></td></tr>`;});document.getElementById('devices').innerHTML=h;});}
-function del(id){if(confirm('Delete device?')){fetch('/api/web/device/'+id,{method:'DELETE',credentials:'include'}).then(()=>refresh());}}
-refresh();setInterval(refresh,10000);
-</script></body></html>'''
-
-DEVICE_PAGE_TEMPLATE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Device {device_id}</title></head>
-<body style="background:#1a1a2e;color:#eee;font-family:monospace;padding:20px;">
-<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:10px;">
-<h1 style="color:#e94560;margin:0;">Device: {device_name} <span id="status" style="font-size:14px;color:#aaa;"></span></h1>
-<div><a href="/" style="color:#e94560;">Dashboard</a> | <a href="/logout" style="color:#e94560;">Logout</a></div></div>
-<div style="margin:10px 0;">
-<button onclick="showTab('files')" style="background:#333;border:none;color:#eee;padding:6px 16px;cursor:pointer;">Files</button>
-<button onclick="showTab('screen')" style="background:#333;border:none;color:#eee;padding:6px 16px;cursor:pointer;">Screen</button>
-<span id="queue-info" style="margin-left:20px;color:#aaa;"></span>
-</div>
-<div id="tab-files" style="display:block;">
-<div><input id="path" value="/storage/emulated/0" style="width:50%;background:#222;color:#eee;border:1px solid #444;padding:4px;">
-<button onclick="listFiles()" style="background:#333;border:none;color:#eee;padding:4px 12px;cursor:pointer;">Go</button>
-<button onclick="listFiles('/')" style="background:#333;border:none;color:#eee;padding:4px 12px;cursor:pointer;">Root</button>
-<button onclick="uploadFile()" style="background:#28a745;border:none;color:#fff;padding:4px 12px;cursor:pointer;">Upload</button>
-<button onclick="uploadBig()" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Upload Big</button>
-</div>
-<table style="width:100%;border-collapse:collapse;margin-top:10px;">
-<thead><tr style="background:#222;"><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
-<tbody id="filelist"></tbody></table>
-</div>
-<div id="tab-screen" style="display:none;">
-<img id="screen-img" style="width:100%;max-width:600px;border:1px solid #444;cursor:crosshair;" />
-<div style="margin-top:10px;">
-<button onclick="sendTouch(0.5,0.5,'click')" style="background:#28a745;border:none;color:#fff;padding:4px 12px;cursor:pointer;">Click</button>
-<button onclick="sendSwipe(0.2,0.5,0.8,0.5)" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Swipe H</button>
-<button onclick="sendSwipe(0.5,0.2,0.5,0.8)" style="background:#f0ad4e;border:none;color:#000;padding:4px 12px;cursor:pointer;">Swipe V</button>
-</div>
-</div>
-<div id="upload-modal" style="display:none;position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7);">
-<div style="background:#222;padding:20px;margin:10% auto;width:300px;border-radius:8px;">
-<h3>Upload File</h3>
-<input id="upload-path" placeholder="Target path" style="width:100%;background:#333;color:#eee;border:none;padding:6px;margin:6px 0;">
-<input id="upload-file" type="file" style="width:100%;margin:6px 0;">
-<button onclick="doUpload()" style="background:#28a745;border:none;color:#fff;padding:6px 12px;cursor:pointer;">Upload</button>
-<button onclick="document.getElementById('upload-modal').style.display='none'" style="background:#e94560;border:none;color:#fff;padding:6px 12px;cursor:pointer;">Cancel</button>
-</div>
-</div>
-<script>
-const deviceId='{device_id}';let currentPath='/storage/emulated/0';let bigMode=false;
-const ws=new WebSocket('wss://'+location.host+'/ws/view/'+deviceId);
-ws.onopen=()=>document.getElementById('status').textContent='🟢 Online';
-ws.onclose=()=>document.getElementById('status').textContent='🔴 Offline';
-ws.onmessage=e=>{if(e.data instanceof Blob){document.getElementById('screen-img').src=URL.createObjectURL(e.data);}else{try{const d=JSON.parse(e.data);console.log('Response:',d);}catch(e){}}};
-function showTab(t){document.querySelectorAll('[id^="tab-"]').forEach(el=>el.style.display='none');document.getElementById('tab-'+t).style.display='block';}
-function updateQueueInfo(){fetch('/api/devices',{credentials:'include'}).then(r=>r.json()).then(data=>{const d=data.find(x=>x.device_id===deviceId);if(d)document.getElementById('queue-info').textContent='Queue: '+(d.queue_count||0);});}
-function listFiles(path){if(path!==undefined)currentPath=path;else currentPath=document.getElementById('path').value;document.getElementById('path').value=currentPath;fetch('/api/device/'+deviceId+'/files?path='+encodeURIComponent(currentPath),{credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Command queued, check later');updateQueueInfo();return;}let html='';if(currentPath!=='/')html+='<tr><td><a href="#" onclick="listFiles(\''+currentPath+'/..\')">..</a></td><td></td><td></td><td></td></tr>';data.forEach(item=>{const isDir=item.is_dir;const size=isDir?'-':(item.size/1024).toFixed(1)+' KB';const actions=isDir?'<button onclick="listFiles(\''+currentPath+'/'+item.name+'\')">Open</button>':'<button onclick="downloadFile(\''+currentPath+'/'+item.name+'\')">Download</button> <button onclick="renameFile(\''+currentPath+'/'+item.name+'\')">Rename</button> <button onclick="deleteFile(\''+currentPath+'/'+item.name+'\')">Delete</button>'+(item.name.endsWith('.apk')?' <button onclick="installApk(\''+currentPath+'/'+item.name+'\')">Install</button>':'');html+='<tr><td>'+(isDir?'📁':'📄')+' '+item.name+'</td><td>'+size+'</td><td>'+(item.modified||'')+'</td><td>'+actions+'</td></tr>';});document.getElementById('filelist').innerHTML=html;});}
-function downloadFile(path){fetch('/api/device/'+deviceId+'/file?path='+encodeURIComponent(path),{credentials:'include'}).then(res=>{if(res.status===202)return res.json().then(data=>{alert('Queued: '+data.detail);throw new Error('queued');});return res.blob();}).then(blob=>{const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=path.split('/').pop();a.click();}).catch(err=>{if(err.message!=='queued')console.error(err);});}
-function deleteFile(path){if(!confirm('Delete '+path+'?'))return;fetch('/api/device/'+deviceId+'/file?path='+encodeURIComponent(path),{method:'DELETE',credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else listFiles();}).catch(err=>alert(err));}
-function renameFile(path){const newPath=prompt('New name:',path);if(!newPath||newPath===path)return;fetch('/api/device/'+deviceId+'/file?old_path='+encodeURIComponent(path)+'&new_path='+encodeURIComponent(newPath),{method:'PUT',credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else listFiles();}).catch(err=>alert(err));}
-function installApk(path){if(!confirm('Install APK '+path+'?'))return;fetch('/api/device/'+deviceId+'/install_apk',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'apk_path='+encodeURIComponent(path),credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Queued');updateQueueInfo();}else alert(data.status==='ok'?'Installed':'Error');}).catch(err=>alert(err));}
-function uploadFile(){bigMode=false;document.getElementById('upload-modal').style.display='block';}
-function uploadBig(){bigMode=true;document.getElementById('upload-modal').style.display='block';}
-function doUpload(){const file=document.getElementById('upload-file').files[0];const path=document.getElementById('upload-path').value;if(!file||!path){alert('Select file and path');return;}const fd=new FormData();fd.append('file',file);fd.append('path',path);const endpoint=bigMode?'/upload_big':'';fetch('/api/device/'+deviceId+'/file'+endpoint,{method:'POST',body:fd,credentials:'include'}).then(r=>r.json()).then(data=>{if(data.status==='queued'){alert('Upload queued');updateQueueInfo();}else if(data.status==='ok'){alert('Uploaded');document.getElementById('upload-modal').style.display='none';listFiles();}else alert('Error');}).catch(err=>alert(err));}
-function sendTouch(x,y,action){ws.send(JSON.stringify({command:'touch',x,y,action}));}
-function sendSwipe(x1,y1,x2,y2,duration=300){ws.send(JSON.stringify({command:'swipe',x1,y1,x2,y2,duration}));}
-document.getElementById('screen-img').addEventListener('click',function(e){const rect=this.getBoundingClientRect();const x=(e.clientX-rect.left)/rect.width;const y=(e.clientY-rect.top)/rect.height;sendTouch(x,y,'click');});
-listFiles();setInterval(updateQueueInfo,5000);
-</script></body></html>'''
-
-async def web_auth(request: Request):
-    token = request.cookies.get("session_token")
-    if not token: return None
-    async with aiosqlite.connect(DATABASE_URL) as db:
-        cur = await db.execute("SELECT * FROM sessions WHERE token=?", (token,))
-        if await cur.fetchone(): return token
-    return None
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    session = await web_auth(request)
-    return DASHBOARD_PAGE if session else LOGIN_PAGE
-
-@app.get("/device/{device_id}", response_class=HTMLResponse)
-async def device_page(request: Request, device_id: str):
-    session = await web_auth(request)
-    if not session: return LOGIN_PAGE
-    async with aiosqlite.connect(DATABASE_URL) as db:
-        try: device = await get_device_or_404(device_id, db)
-        except: return HTMLResponse("Device not found", status_code=404)
-    return HTMLResponse(DEVICE_PAGE_TEMPLATE.format(device_id=device_id, device_name=device['name']))
-
-@app.post("/login")
-async def login(request: Request, password: str = Form(...)):
-    if password != ADMIN_PASSWORD:
-        return HTMLResponse(LOGIN_PAGE.replace('</form>', '</form><div style="color:#e94560;margin-top:10px;">Invalid password</div>'), status_code=401)
-    token = generate_session_token()
-    async with aiosqlite.connect(DATABASE_URL) as db:
-        await db.execute("INSERT INTO sessions(token) VALUES(?)", (token,))
-        await db.commit()
-    await log_action(token, "login")
-    resp = HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
-    resp.set_cookie("session_token", token, max_age=int(SESSION_TIMEOUT.total_seconds()), httponly=True, secure=False, samesite='lax')
-    return resp
-
-@app.get("/logout")
-async def logout(request: Request):
-    token = request.cookies.get("session_token")
-    if token:
-        async with aiosqlite.connect(DATABASE_URL) as db:
-            await db.execute("DELETE FROM sessions WHERE token=?", (token,))
-            await db.commit()
-        await log_action(token, "logout")
-    resp = HTMLResponse(content="<script>window.location.href='/';</script>", status_code=302)
-    resp.delete_cookie("session_token")
-    return resp
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+async def swagger_docs(session: str = Depends(get_current_user
